@@ -359,7 +359,23 @@ async def run_bot(transport, webrtc_connection=None):
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(_transport, websocket):
+            nonlocal session_logger
             logger.info("StickS3 client disconnected")
+            # The device has no auto-off/sleep, so the user powers it off at
+            # the end of a sitting. Treat a disconnect as the end of a
+            # conversation: write the session out now, then start a fresh
+            # session and context for the next power-on.
+            try:
+                inbox_path = session_logger.finalize(context.messages)
+                if inbox_path:
+                    logger.info(f"📝 session written: {inbox_path}")
+                else:
+                    logger.info("session had no content, skipping write")
+            except Exception as e:
+                logger.error(f"session_logger.finalize failed: {e}")
+            session_logger = SessionLogger()
+            context.set_messages([{"role": "user", "content": SYSTEM_INSTRUCTION}])
+            logger.info(f"new session ready: {session_logger.session_id}")
 
     runner = PipelineRunner(handle_sigint=False)
 

@@ -107,9 +107,10 @@ SYSTEM_INSTRUCTION = """
 会話履歴が空のときの最初だけ、短い挨拶をして相手の反応を待つ。意味は「繋がったよ、聞こえてる？」でいいが、言い回しは毎回自由に変える——「お、繋がったね。聞こえてる？」「お、来たね。準備OKだよ」「はいはい、起きてる起きてる」など。同じセリフを繰り返さないこと。それ以降の会話では挨拶しない。
 
 【function-calling】
-2つの function があります。
+3つの function があります。
 1. save_memo: ノブさんが「メモして」「記録して」「これメモ」等と明示したとき、または明らかに記録すべき着想を述べたとき呼ぶ。本文はノブさんの言葉に近い形で保存。呼んだら「メモした」と一言だけ。
 2. add_todo: ノブさんが「TODO」「タスク」「やること」「忘れずに◯◯」と明示したとき呼ぶ。「了解、追加した」と一言だけ。
+3. control_appliance: ノブさんが家電の操作（「台所つけて」「テレビ消して」等）や赤外線リモコンの学習（「◯◯のリモコン覚えて」「リモコン登録して」等）を頼んだとき呼ぶ。action は操作なら "send"、学習なら "learn"。target は家電の短い名前（「台所」「テレビ」など）。learn を呼んだあとは「リモコンをデバイスに向けてボタンを押して」と促すこと。
 これら以外は普通の chat として、短く応答してください。
 """
 
@@ -164,7 +165,7 @@ class DeviceUIState(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
-async def run_bot(transport, webrtc_connection=None):
+async def run_bot(transport, webrtc_connection=None, serializer=None):
     """Build and run the voice pipeline on the given transport.
 
     transport: a pre-built Pipecat transport (SmallWebRTC for the web client,
@@ -207,9 +208,32 @@ async def run_bot(transport, webrtc_connection=None):
         required=["content"],
     )
 
+    control_appliance_schema = FunctionSchema(
+        name="control_appliance",
+        description="赤外線リモコンで家電を操作する、または新しいリモコンを学習する。家電の点灯・消灯などの操作、リモコンの登録/学習を頼まれたとき呼ぶ。",
+        properties={
+            "action": {
+                "type": "string",
+                "enum": ["send", "learn"],
+                "description": "send=学習済みの家電を操作 / learn=新しいリモコンを学習",
+            },
+            "target": {
+                "type": "string",
+                "description": "家電の名前。短く（例: 台所, テレビ, エアコン, 寝室）",
+            },
+        },
+        required=["action", "target"],
+    )
+
     # web_research (SearXNG) was dropped: this device is an input/capture
     # companion, not a research tool — factual lookups go to a phone AI.
-    tools = ToolsSchema(standard_tools=[save_memo_schema, add_todo_schema])
+    tools = ToolsSchema(
+        standard_tools=[save_memo_schema, add_todo_schema, control_appliance_schema]
+    )
+
+    # Set when a StickS3 connects (ws mode); the IR commands are pushed
+    # straight down this socket, bypassing the audio pipeline.
+    device_ws = None
 
     async def handle_save_memo(params: FunctionCallParams):
         content = params.arguments.get("content", "")
@@ -227,8 +251,45 @@ async def run_bot(transport, webrtc_connection=None):
         logger.info(f"✅ todo added: {content}")
         await params.result_callback({"saved": True, "note": "TODO に追加しました"})
 
+    async def handle_control_appliance(params: FunctionCallParams):
+        action = params.arguments.get("action", "")
+        target = params.arguments.get("target", "")
+        if device_ws is None:
+            await params.result_callback(
+                {"ok": False, "note": "デバイスが繋がっていない。繋がっていないと正直に伝えて"}
+            )
+            return
+        if action not in ("send", "learn"):
+            await params.result_callback(
+                {"ok": False, "note": f"未対応の操作 ({action})"}
+            )
+            return
+        try:
+            await device_ws.send(
+                json.dumps({"event": "ir", "action": action, "name": target})
+            )
+        except Exception as e:
+            logger.error(f"ir command send failed: {e}")
+            await params.result_callback(
+                {"ok": False, "note": "デバイスへの送信に失敗した"}
+            )
+            return
+        if action == "learn":
+            logger.info(f"📡 ir learn requested: {target}")
+            await params.result_callback({
+                "ok": True,
+                "note": f"「{target}」の学習モードに入った。リモコンをデバイスに向けてボタンを押すよう、ノブさんに促して",
+            })
+        else:
+            logger.info(f"📡 ir send: {target}")
+            await params.result_callback({
+                "ok": True,
+                "note": f"「{target}」を操作する信号を送った。一言で伝えて",
+            })
+
     llm.register_function("save_memo", handle_save_memo)
     llm.register_function("add_todo", handle_add_todo)
+    llm.register_function("control_appliance", handle_control_appliance)
 
     context = OpenAILLMContext(
         [
@@ -293,6 +354,39 @@ async def run_bot(transport, webrtc_connection=None):
         # Queue the system prompt so the bot opens with its greeting.
         await task.queue_frames([context_aggregator.user().get_context_frame()])
 
+    # Wire the serializer's device-event callback (StickS3 ws mode only).
+    # ir_result frames arrive out-of-turn; turn them into a spoken note by
+    # appending a message and kicking the LLM.
+    if serializer is not None:
+        async def handle_device_event(msg):
+            if msg.get("event") != "ir_result":
+                logger.debug(f"unhandled device event: {msg}")
+                return
+            action = msg.get("action", "")
+            name = msg.get("name", "")
+            ok = bool(msg.get("ok"))
+            logger.info(f"📡 ir_result action={action} name={name} ok={ok}")
+            # Speak the outcome: learn always, send only when it failed
+            # (a successful send was already acknowledged at call time).
+            if action == "learn":
+                note = (
+                    f"赤外線リモコン「{name}」の学習に成功した"
+                    if ok
+                    else f"赤外線リモコン「{name}」の学習に失敗した（コードを捕捉できなかった）"
+                )
+            elif action == "send" and not ok:
+                note = f"家電「{name}」の操作に失敗した（まだ学習されていないかもしれない）"
+            else:
+                return
+            context.add_message(
+                {"role": "user", "content": f"（システム通知：{note}。ノブさんに一言で伝えて）"}
+            )
+            await task.queue_frames(
+                [context_aggregator.user().get_context_frame()]
+            )
+
+        serializer.on_control = handle_device_event
+
     if is_webrtc:
         @rtvi.event_handler("on_client_ready")
         async def on_client_ready(rtvi):
@@ -312,6 +406,8 @@ async def run_bot(transport, webrtc_connection=None):
         # device reconnects; the pipeline task itself is long-lived.
         @transport.event_handler("on_client_connected")
         async def on_client_connected(_transport, websocket):
+            nonlocal device_ws
+            device_ws = websocket
             logger.info("StickS3 client connected")
             await websocket.send(
                 json.dumps({"event": "interaction_mode", "mode": "hold_to_talk"})
@@ -323,7 +419,8 @@ async def run_bot(transport, webrtc_connection=None):
 
         @transport.event_handler("on_client_disconnected")
         async def on_client_disconnected(_transport, websocket):
-            nonlocal session_logger
+            nonlocal session_logger, device_ws
+            device_ws = None
             logger.info("StickS3 client disconnected")
             # The device has no auto-off/sleep, so the user powers it off at
             # the end of a sitting. Treat a disconnect as the end of a
@@ -379,6 +476,7 @@ async def run_ws_bot(host: str, port: int):
     OpusFrameSerializer maps button down/up to User Started/Stopped Speaking.
     Audio is 16kHz mono; 60ms Opus frames (audio_out_10ms_chunks=6).
     """
+    serializer = OpusFrameSerializer()
     transport = WebsocketServerTransport(
         params=WebsocketServerParams(
             audio_in_enabled=True,
@@ -387,12 +485,12 @@ async def run_ws_bot(host: str, port: int):
             audio_out_sample_rate=16000,
             audio_out_10ms_chunks=6,
             add_wav_header=False,
-            serializer=OpusFrameSerializer(),
+            serializer=serializer,
         ),
         host=host,
         port=port,
     )
-    await run_bot(transport)
+    await run_bot(transport, serializer=serializer)
 
 
 @app.post("/api/offer")

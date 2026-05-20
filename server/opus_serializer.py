@@ -47,11 +47,15 @@ FRAME_MS = 60
 class OpusFrameSerializer(FrameSerializer):
     """Serializer for the StickS3 device WebSocket link."""
 
-    def __init__(self):
+    def __init__(self, on_control=None):
         self._decoder = None
         self._resampler = None
         self._encoder = None
         self._enc_pts = 0
+        # Optional async callback(msg: dict) for control events the
+        # serializer does not turn into pipeline frames (e.g. ir_result).
+        # bot.py wires this after the pipeline task is built.
+        self.on_control = on_control
 
     @property
     def type(self) -> FrameSerializerType:
@@ -129,7 +133,7 @@ class OpusFrameSerializer(FrameSerializer):
     async def deserialize(self, data: Union[str, bytes]) -> Optional[Frame]:
         if isinstance(data, (bytes, bytearray)):
             return self._decode_audio(bytes(data))
-        return self._handle_control(data)
+        return await self._handle_control(data)
 
     def _decode_audio(self, data: bytes) -> Optional[InputAudioRawFrame]:
         self._init_codecs()
@@ -151,7 +155,7 @@ class OpusFrameSerializer(FrameSerializer):
             num_channels=1,
         )
 
-    def _handle_control(self, data: str) -> Optional[Frame]:
+    async def _handle_control(self, data: str) -> Optional[Frame]:
         try:
             msg = json.loads(data)
         except (ValueError, TypeError):
@@ -163,6 +167,14 @@ class OpusFrameSerializer(FrameSerializer):
             return None
         if event == "button":
             return self._handle_button(msg)
+        # ir_result (and any future async device events) are not pipeline
+        # frames; hand them to bot.py via the on_control callback.
+        if self.on_control is not None:
+            try:
+                await self.on_control(msg)
+            except Exception as e:
+                logger.error(f"on_control({event!r}) failed: {e}")
+            return None
         logger.debug(f"unhandled control event: {event!r}")
         return None
 

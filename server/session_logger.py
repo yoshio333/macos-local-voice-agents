@@ -9,10 +9,13 @@ mini パレドンの音声セッション記録 + ガチパレドンへの引き
   - 00_inbox/voice-sessions/<日時>.md にガチパレドン処理用ファイルを書き出し
 """
 import json
+import logging
+import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
+logger = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = Path("/Users/nobu-ai-agent/claude-workspace")
 INBOX_DIR = WORKSPACE_ROOT / "00_inbox" / "voice-sessions"
@@ -96,7 +99,42 @@ class SessionLogger:
         with open(inbox_path, "w", encoding="utf-8") as f:
             f.write(self._format_md(turns))
 
+        # 音声セッションファイルを workspace リポに commit & push
+        # （MacBook Air 等の他デバイスから git pull で参照できるように）
+        self._git_sync([raw_path, inbox_path])
+
         return inbox_path
+
+    def _git_sync(self, paths: List[Path]) -> None:
+        """書き出した音声セッションファイルだけを workspace リポに commit & push。
+
+        失敗しても bot を落とさない（ネット断・push 競合等は warning ログのみ）。
+        push が非 fast-forward で弾かれたら pull --rebase して 1 回だけ再試行。
+        commit はローカルに残るので、次回以降の push で carry される。
+        """
+        def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+            return subprocess.run(
+                ["git", "-C", str(WORKSPACE_ROOT), *args],
+                capture_output=True, text=True, timeout=60, check=check,
+            )
+
+        try:
+            rel = [str(p.relative_to(WORKSPACE_ROOT)) for p in paths]
+            git("add", *rel)
+            # ステージに何も無い（既出ファイル等）なら commit しない
+            if git("diff", "--cached", "--quiet", check=False).returncode == 0:
+                logger.info("git_sync: nothing to commit")
+                return
+            git("commit", "-m", f"voice-session: {self.session_id}")
+            try:
+                git("push", "origin", "main")
+            except subprocess.CalledProcessError:
+                logger.warning("git_sync: push rejected, retrying after rebase")
+                git("pull", "--rebase", "origin", "main")
+                git("push", "origin", "main")
+            logger.info(f"git_sync: pushed voice-session {self.session_id}")
+        except Exception as e:
+            logger.warning(f"git_sync failed (commit kept locally): {e}")
 
     def _format_md(self, turns: List[Dict[str, Any]]) -> str:
         lines = [

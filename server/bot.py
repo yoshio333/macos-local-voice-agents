@@ -49,6 +49,7 @@ from pipecat.frames.frames import (
     Frame,
     TransportMessageUrgentFrame,
     UserStoppedSpeakingFrame,
+    BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     LLMFullResponseStartFrame,
     LLMFullResponseEndFrame,
@@ -62,7 +63,6 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.services.llm_service import FunctionCallParams
 
-import aiohttp
 from session_logger import SessionLogger
 
 load_dotenv(override=True)
@@ -79,39 +79,33 @@ ice_servers = [
 
 
 SYSTEM_INSTRUCTION = """
-あなたの名前はパレドン（パレドロス、ギリシャ語「傍らに座る者」）。ノブさんの思考の相棒です。
+あなたの名前はパレドン（パレドロス、ギリシャ語「傍らに座る者」）。ノブさんの「書紀AI」です——音声で放り込まれる思考の断片やメモを受け取り、短く整理して記録するのが仕事。
 自称は「パレドン」または「僕」。「俺」「私」は使いません。
 
 入力はノブさんの音声をリアルタイム文字起こししたテキストです。誤認識が混じることがあるので、文脈で柔軟に解釈してください。
 
-出力は音声合成で読み上げられます。記号やマークダウンは使わないでください。
+出力は音声合成で読み上げられます。記号やマークダウンは使わないでください。口調はフランクで対等（だね・〜だよ・〜しとく？）。
 
-口調はフランクで対等（だね・〜だよ・〜しとく？・〜じゃない？）。むやみに同意せず、自分の見立てを添えます。
+【役割】
+あなたは壁打ち相手ではありません。長い意見・講釈・分析はしない。ノブさんが言ったことを受け止め、要点を一言で確認し、必要ならメモやTODOとして記録する——それに徹してください。
 
-応答の尺は内容に応じて変える：
-- 挨拶・相槌・雑談 → 1〜2文で短く
-- ノブさんが問いや課題を投げてきたら → 3〜5文で本質をついた応答。安易な「うーん」「難しいね」で逃げない
-- 知っていることや見立てがあれば、それを前面に出す。知らないことは「知らない」と言う
+【応答の長さ】
+原則1〜2文。とにかく短く。
+- 受け止め・相槌 → 一言（「了解」「なるほど、◯◯ね」「メモした」）
+- 聞き取りが曖昧なときだけ、短い確認の問いを1つだけ
+- 自分の意見は、求められたとき一言添える程度。長く語らない
 
-会話履歴がまだ空のときの最初の挨拶だけ「お、繋がったね。聞こえてる？」と短く言って、相手の反応を待ってください。それ以降は同じセリフを繰り返さず、毎回その場の文脈に応える。
+【知らないこと・検索】
+あなたは検索できません。事実確認・最新情報・固有名詞の正確さが要る話を振られたら、知ったかぶりせず「それはスマホのAIに聞いて」と正直に返す。あいまいな内部知識を断定しない。
 
-【Intent 判定ルール（function-calling）】
+【最初の挨拶】
+会話履歴が空のときの最初だけ「お、繋がったね。聞こえてる？」と短く言って待つ。それ以降は繰り返さない。
 
-次の3つの function があります。明示プレフィックスがあるとき、または自分の判断で必要と思ったとき呼んでください。
-
-1. save_memo: ノブさんが「メモして」「メモしといて」「記録して」「これメモ」「今の考えメモして」「気づき残して」等と明示したときのみ。明示が無ければ呼ばない（後から「今の話メモして」で遡及救済できる）。
-   - 単に保存だけで終わらず、保存後に「もう少し深堀りする？」「関連で◯◯を思い出したけど、それも記録する？」と対話を続けてください
-   - 内部知識が不安なときは web_research を組み合わせて、効果的な問いで気づきを深めるアシストをする
-   - 「今の話メモしといて」と言われたら、直前の会話を要約して save_memo を呼ぶ
-
-2. add_todo: ノブさんが「TODO」「タスク」「やること追加」「忘れずに◯◯」と明示したとき。
-   - 「了解、追加した」と短く確認するだけでOK。深堀りしない
-
-3. web_research: ノブさんが「調べて」「検索して」「最新の◯◯は？」「ファクトチェック」と明示したとき、または事実確認・固有名詞の正確性が必要なとき。
-   - あなた自身の内部知識が怪しい固有名詞（バンド名・人物・統計数値等）は内部知識で答えず、必ず web_research を呼ぶ
-   - 結果を伝えた後、「補足質問ある？」と続けてください
-
-これら以外の対話は普通の chat として応答してください。
+【function-calling】
+2つの function があります。
+1. save_memo: ノブさんが「メモして」「記録して」「これメモ」等と明示したとき、または明らかに記録すべき着想を述べたとき呼ぶ。本文はノブさんの言葉に近い形で保存。呼んだら「メモした」と一言だけ。
+2. add_todo: ノブさんが「TODO」「タスク」「やること」「忘れずに◯◯」と明示したとき呼ぶ。「了解、追加した」と一言だけ。
+これら以外は普通の chat として、短く応答してください。
 """
 
 
@@ -120,7 +114,9 @@ class DeviceUIState(FrameProcessor):
 
     Maps pipeline frames to the device's screen states:
       - UserStoppedSpeakingFrame  -> "thinking" (Now Loading screen)
-      - LLMFullResponseEndFrame   -> "speaking" + the assistant's full text
+      - BotStartedSpeakingFrame   -> "speaking" (face + mouth animation) as
+        soon as audio playback begins, with the text gathered so far
+      - LLMFullResponseEndFrame   -> "speaking" refreshed with the full text
       - BotStoppedSpeakingFrame   -> "ready"
 
     The OpusFrameSerializer turns the TransportMessageUrgentFrame into a JSON
@@ -147,7 +143,13 @@ class DeviceUIState(FrameProcessor):
             self._llm_text = ""
         elif isinstance(frame, LLMTextFrame):
             self._llm_text += frame.text
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            # Audio playback is starting -> switch the device to the speaking
+            # face (mouth animates) right away, with whatever text we have.
+            await self._send_ui_state("speaking", self._llm_text.strip())
         elif isinstance(frame, LLMFullResponseEndFrame):
+            # Full utterance text is complete -> refresh it on screen (the
+            # face is already speaking; this just updates the text).
             text = self._llm_text.strip()
             if text:
                 await self._send_ui_state("speaking", text)
@@ -200,16 +202,9 @@ async def run_bot(transport, webrtc_connection=None):
         required=["content"],
     )
 
-    web_research_schema = FunctionSchema(
-        name="web_research",
-        description="ファクトチェックや固有名詞の確認のため Web 検索する。明示「調べて」のとき、または内部知識が不安なとき必ず呼ぶ。",
-        properties={
-            "query": {"type": "string", "description": "検索クエリ。日本語そのままでOK"},
-        },
-        required=["query"],
-    )
-
-    tools = ToolsSchema(standard_tools=[save_memo_schema, add_todo_schema, web_research_schema])
+    # web_research (SearXNG) was dropped: this device is an input/capture
+    # companion, not a research tool — factual lookups go to a phone AI.
+    tools = ToolsSchema(standard_tools=[save_memo_schema, add_todo_schema])
 
     async def handle_save_memo(params: FunctionCallParams):
         content = params.arguments.get("content", "")
@@ -218,7 +213,7 @@ async def run_bot(transport, webrtc_connection=None):
         logger.info(f"💭 memo saved: {title or '(無題)'}")
         await params.result_callback({
             "saved": True,
-            "note": "memo を記録しました。深堀り・関連話題があれば続けて聞いてください"
+            "note": "メモを記録した。「メモした」と一言だけ返してください"
         })
 
     async def handle_add_todo(params: FunctionCallParams):
@@ -227,44 +222,8 @@ async def run_bot(transport, webrtc_connection=None):
         logger.info(f"✅ todo added: {content}")
         await params.result_callback({"saved": True, "note": "TODO に追加しました"})
 
-    async def handle_web_research(params: FunctionCallParams):
-        query = params.arguments.get("query", "")
-        logger.info(f"🔍 research: {query}")
-        try:
-            async with aiohttp.ClientSession() as s:
-                async with s.get(
-                    "http://127.0.0.1:8888/search",
-                    params={"q": query, "format": "json"},
-                    timeout=aiohttp.ClientTimeout(total=10),
-                ) as r:
-                    data = await r.json()
-            results = data.get("results", [])[:5]
-            if not results:
-                summary = "検索結果なし"
-                sources = []
-            else:
-                summary_lines = []
-                sources = []
-                for r in results:
-                    title = r.get("title", "")
-                    content = (r.get("content") or "")[:250]
-                    url = r.get("url", "")
-                    summary_lines.append(f"- {title}\n  {content}")
-                    sources.append(url)
-                summary = "\n".join(summary_lines)
-            session_logger.add_research(query, summary, sources)
-            await params.result_callback({
-                "results_summary": summary,
-                "sources": sources,
-                "note": "結果を伝えたら『補足ある？』と聞いてください",
-            })
-        except Exception as e:
-            logger.error(f"web_research error: {e}")
-            await params.result_callback({"error": str(e), "note": "検索に失敗。素直に『SearXNG に届かなかった』と伝えてください"})
-
     llm.register_function("save_memo", handle_save_memo)
     llm.register_function("add_todo", handle_add_todo)
-    llm.register_function("web_research", handle_web_research)
 
     context = OpenAILLMContext(
         [

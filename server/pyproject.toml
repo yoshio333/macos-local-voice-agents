@@ -21,3 +21,6 @@ dependencies = [
     "pyobjc-framework-Cocoa",
     "pyobjc-framework-ApplicationServices",
 ]
+
+[tool.uv.sources]
+mlx-audio = { git = "https://github.com/Blaizzy/mlx-audio.git", rev = "6fd8b9fd9e24d2fb9a5cb05db960bbdc29af6b01" }

@@ -1,5 +1,5 @@
 #
-# Process-isolated Kokoro TTS service
+# Process-isolated MLX TTS service (Kokoro / Marvis / Qwen3-TTS)
 # Uses a separate process to avoid Metal threading conflicts on Apple Silicon
 #
 
@@ -25,42 +25,55 @@ from pipecat.utils.tracing.service_decorators import traced_tts
 
 
 class TTSMLXIsolated(TTSService):
-    """Completely isolated Kokoro TTS using subprocess to avoid Metal issues."""
+    """Isolated MLX TTS using subprocess to avoid Metal issues.
+
+    Streaming path:
+        For Qwen3-TTS models (which support streaming generation), the worker
+        is invoked with `generate_stream` and audio is yielded chunk-by-chunk
+        as it's produced. First-chunk latency drops dramatically on long text.
+        Kokoro/Marvis still use the original one-shot `generate` command.
+    """
 
     def __init__(
         self,
         *,
         model: str = "mlx-community/Kokoro-82M-bf16",
         voice: str = "af_heart",
+        language: Optional[str] = None,
+        speed: float = 1.0,
         device: Optional[str] = None,
         sample_rate: int = 24000,
+        streaming_interval: float = 0.32,
         **kwargs,
     ):
-        """Initialize the isolated Kokoro TTS service."""
         super().__init__(sample_rate=sample_rate, **kwargs)
 
         self._model_name = model
         self._voice = voice
+        self._language = language
+        self._speed = speed
         self._device = device
+        self._streaming_interval = streaming_interval
+        self._supports_streaming = "Qwen3-TTS" in model
 
         self._process = None
         self._initialized = False
 
-        # Get path to worker script
         self._worker_script = self._get_worker_script_path()
 
         self._settings = {
             "model": model,
             "voice": voice,
+            "language": language,
             "sample_rate": sample_rate,
         }
 
     def _get_worker_script_path(self) -> str:
-        """Get the path to the standalone worker script."""
-        # Look for kokoro_worker.py in the same directory as this file
         current_dir = Path(__file__).parent
         if self._model_name.startswith("Marvis-AI"):
             worker_path = current_dir / "marvis_worker.py"
+        elif "Qwen3-TTS" in self._model_name:
+            worker_path = current_dir / "qwen3tts_worker.py"
         else:
             worker_path = current_dir / "kokoro_worker.py"
 
@@ -75,13 +88,11 @@ class TTSMLXIsolated(TTSService):
         return str(worker_path)
 
     def _start_worker(self):
-        """Start the worker process."""
         try:
             self._process = subprocess.Popen(
                 [sys.executable, self._worker_script],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                # stderr=subprocess.PIPE,
                 text=True,
                 bufsize=0,
             )
@@ -91,90 +102,91 @@ class TTSMLXIsolated(TTSService):
             logger.error(f"Failed to start worker: {e}")
             return False
 
-    def _send_command(self, command: dict) -> dict:
-        """Send command to worker and get response."""
+    def _ensure_worker(self) -> bool:
+        if not self._process or self._process.poll() is not None:
+            logger.debug("Starting worker process...")
+            return self._start_worker()
+        return True
+
+    def _write_command(self, command: dict) -> bool:
         try:
-            if not self._process or self._process.poll() is not None:
-                logger.debug("Starting worker process...")
-                if not self._start_worker():
-                    return {"error": "Failed to start worker"}
-
-            # Send command
-            cmd_json = json.dumps(command) + "\n"
-            logger.debug(f"Sending command: {command}")
-            self._process.stdin.write(cmd_json)
+            self._process.stdin.write(json.dumps(command) + "\n")
             self._process.stdin.flush()
+            return True
+        except Exception as e:
+            logger.error(f"Worker write error: {e}")
+            return False
 
-            # Read response with timeout
-            import select
+    def _read_line_blocking(self, timeout: float = 30.0) -> Optional[str]:
+        """Read a single response line with timeout. Returns None on timeout/EOF."""
+        import select
 
-            ready, _, _ = select.select([self._process.stdout], [], [], 10.0)  # 10 second timeout
+        ready, _, _ = select.select([self._process.stdout], [], [], timeout)
+        if not ready:
+            return None
+        line = self._process.stdout.readline()
+        if not line:
+            return None
+        return line
 
-            if not ready:
+    def _send_command(self, command: dict) -> dict:
+        """Send a command expecting a single-line JSON response."""
+        try:
+            if not self._ensure_worker():
+                return {"error": "Failed to start worker"}
+            if not self._write_command(command):
+                return {"error": "Failed to write command"}
+
+            line = self._read_line_blocking(timeout=30.0)
+            if line is None:
+                if self._process.poll() is not None:
+                    return {"error": "Worker process died"}
                 return {"error": "Worker response timeout"}
 
-            response_line = self._process.stdout.readline()
-            if not response_line:
-                # Check if process died
-                if self._process.poll() is not None:
-                    stderr_output = self._process.stderr.read() if self._process.stderr else ""
-                    return {"error": f"Worker process died. stderr: {stderr_output}"}
-                return {"error": "No response from worker"}
-
-            response_data = json.loads(response_line.strip())
-            # Don't log the full response if it contains audio data (too verbose)
-            if "audio" in response_data:
-                logger.debug(
-                    f"Worker response: success with {len(response_data.get('audio', ''))} chars of audio data"
-                )
+            data = json.loads(line.strip())
+            if "audio" in data:
+                logger.debug(f"Worker response: success, {len(data['audio'])} chars audio")
             else:
-                logger.debug(f"Worker response: {response_line.strip()}")
-            return response_data
-
+                logger.debug(f"Worker response: {line.strip()[:200]}")
+            return data
         except Exception as e:
             logger.error(f"Worker communication error: {e}")
-            # Get stderr if available
-            if self._process and self._process.stderr:
-                try:
-                    stderr_output = self._process.stderr.read()
-                    logger.error(f"Worker stderr: {stderr_output}")
-                except:
-                    pass
             return {"error": str(e)}
 
     async def _initialize_if_needed(self):
-        """Initialize the worker if not already done."""
         if self._initialized:
             return True
 
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(
-            None,
-            self._send_command,
-            {"cmd": "init", "model": self._model_name, "voice": self._voice},
-        )
+        init_cmd = {"cmd": "init", "model": self._model_name, "voice": self._voice}
+        if self._language is not None:
+            init_cmd["language"] = self._language
+        if self._speed != 1.0:
+            init_cmd["speed"] = self._speed
+        result = await loop.run_in_executor(None, self._send_command, init_cmd)
 
         if result.get("success"):
             self._initialized = True
-            logger.info("Kokoro worker initialized")
+            logger.info(f"{self._model_name} worker initialized (streaming={self._supports_streaming})")
             return True
         else:
             error_msg = result.get("error", "Unknown error")
             logger.error(f"Worker initialization failed: {error_msg}")
-
-            # Also check if process died
-            if self._process and self._process.poll() is not None:
-                stderr_output = self._process.stderr.read() if self._process.stderr else ""
-                logger.error(f"Worker process stderr: {stderr_output}")
-
             return False
 
     def can_generate_metrics(self) -> bool:
         return True
 
+    async def _yield_audio_bytes(self, audio_bytes: bytes) -> AsyncGenerator[Frame, None]:
+        CHUNK_SIZE = self.chunk_size
+        for i in range(0, len(audio_bytes), CHUNK_SIZE):
+            chunk = audio_bytes[i : i + CHUNK_SIZE]
+            if len(chunk) > 0:
+                yield TTSAudioRawFrame(chunk, self.sample_rate, 1)
+                await asyncio.sleep(0.001)
+
     @traced_tts
     async def run_tts(self, text: str) -> AsyncGenerator[Frame, None]:
-        """Generate speech using isolated worker process."""
         logger.debug(f"{self}: Generating TTS [{text}]")
 
         try:
@@ -183,32 +195,71 @@ class TTSMLXIsolated(TTSService):
 
             yield TTSStartedFrame()
 
-            # Initialize worker if needed
             if not await self._initialize_if_needed():
-                raise RuntimeError("Failed to initialize Kokoro worker")
+                raise RuntimeError(f"Failed to initialize {self._model_name} worker")
 
-            # Generate audio
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
-                None, self._send_command, {"cmd": "generate", "text": text}
-            )
 
-            if not result.get("success"):
-                raise RuntimeError(f"Audio generation failed: {result.get('error')}")
+            if self._supports_streaming:
+                # ----- Streaming path (Qwen3-TTS) -----
+                cmd = {
+                    "cmd": "generate_stream",
+                    "text": text,
+                    "interval": self._streaming_interval,
+                }
 
-            # Decode audio
-            audio_b64 = result["audio"]
-            audio_bytes = base64.b64decode(audio_b64)
+                def _start_stream():
+                    if not self._ensure_worker():
+                        return False
+                    return self._write_command(cmd)
 
-            await self.stop_ttfb_metrics()
+                if not await loop.run_in_executor(None, _start_stream):
+                    raise RuntimeError("Failed to start streaming generation")
 
-            # Stream audio
-            CHUNK_SIZE = self.chunk_size
-            for i in range(0, len(audio_bytes), CHUNK_SIZE):
-                chunk = audio_bytes[i : i + CHUNK_SIZE]
-                if len(chunk) > 0:
-                    yield TTSAudioRawFrame(chunk, self.sample_rate, 1)
-                    await asyncio.sleep(0.001)
+                first_chunk = True
+                total_chunks = 0
+                while True:
+                    line = await loop.run_in_executor(None, self._read_line_blocking, 60.0)
+                    if line is None:
+                        raise RuntimeError("Worker streaming timeout / EOF")
+
+                    try:
+                        msg = json.loads(line.strip())
+                    except json.JSONDecodeError as e:
+                        logger.error(f"Bad worker line: {line.strip()[:200]!r}")
+                        raise RuntimeError(f"Worker JSON parse error: {e}")
+
+                    if msg.get("error"):
+                        raise RuntimeError(f"Worker error: {msg['error']}")
+
+                    chunk_b64 = msg.get("chunk")
+                    if chunk_b64:
+                        if first_chunk:
+                            await self.stop_ttfb_metrics()
+                            first_chunk = False
+                        audio_bytes = base64.b64decode(chunk_b64)
+                        async for frame in self._yield_audio_bytes(audio_bytes):
+                            yield frame
+                        total_chunks += 1
+
+                    if not msg.get("more", False):
+                        logger.debug(
+                            f"{self}: streamed {total_chunks} chunks for [{text[:30]}...]"
+                        )
+                        break
+            else:
+                # ----- One-shot path (Kokoro / Marvis) -----
+                result = await loop.run_in_executor(
+                    None, self._send_command, {"cmd": "generate", "text": text}
+                )
+
+                if not result.get("success"):
+                    raise RuntimeError(f"Audio generation failed: {result.get('error')}")
+
+                audio_bytes = base64.b64decode(result["audio"])
+                await self.stop_ttfb_metrics()
+                async for frame in self._yield_audio_bytes(audio_bytes):
+                    yield frame
 
         except Exception as e:
             logger.error(f"Error in run_tts: {e}")
@@ -219,25 +270,22 @@ class TTSMLXIsolated(TTSService):
             yield TTSStoppedFrame()
 
     def _cleanup(self):
-        """Clean up worker process."""
         if self._process:
             try:
                 self._process.terminate()
                 self._process.wait(timeout=5)
-            except:
+            except Exception:
                 try:
                     self._process.kill()
-                except:
+                except Exception:
                     pass
             self._process = None
 
     async def __aenter__(self):
-        """Async context manager entry."""
         await super().__aenter__()
         await self._initialize_if_needed()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Clean shutdown."""
         self._cleanup()
         await super().__aexit__(exc_type, exc_val, exc_tb)

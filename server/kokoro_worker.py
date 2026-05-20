@@ -35,6 +35,7 @@ class Worker:
     def __init__(self):
         self.model = None
         self.voice = None
+        self.lang_code = None
         
     def initialize(self, model_name, voice):
         if not MLX_AVAILABLE:
@@ -42,8 +43,9 @@ class Worker:
         try:
             self.model = load_model(model_name)
             self.voice = voice
-            # Test generation to ensure everything works
-            list(self.model.generate(text="test", voice=voice, speed=1.0))
+            self.lang_code = voice[0]  # af_*=a, jf_*=j, zf_*=z, bf_*=b 等
+            # Test generation to ensure everything works (lang_code指定で正しい言語pipelineを起動)
+            list(self.model.generate(text="test", voice=voice, speed=1.3, lang_code=self.lang_code))
             return {"success": True}
         except Exception as e:
             return {"error": str(e)}
@@ -54,7 +56,7 @@ class Worker:
                 return {"error": "Not initialized"}
             
             segments = []
-            for result in self.model.generate(text=text, voice=self.voice, speed=1.0):
+            for result in self.model.generate(text=text, voice=self.voice, speed=1.3, lang_code=self.lang_code):
                 # Convert MLX array to numpy immediately
                 audio_data = np.array(result.audio, copy=True)
                 print(f"Generated segment shape: {audio_data.shape}, min: {audio_data.min():.4f}, max: {audio_data.max():.4f}", file=sys.stderr)

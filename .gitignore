@@ -10,3 +10,6 @@ __pycache__
 .env.development.local
 .env.test.local
 .env.production.local
+# Claude working backups
+_archive/
+*.bak.*
